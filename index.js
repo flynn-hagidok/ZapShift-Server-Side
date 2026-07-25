@@ -3,9 +3,16 @@ const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
 require("dotenv").config();
 const stripe = require('stripe')(process.env.STRIPE_SECRET);
-
 const app = express();
 const port = process.env.PORT || 5000;
+const crypto = require("crypto");
+
+function generateTrackingId() {
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const random = crypto.randomBytes(4).toString("hex").toUpperCase();
+
+    return `TRK-${date}-${random}`;
+};
 
 app.use(express.json());
 app.use(cors());
@@ -18,6 +25,7 @@ async function connectToMongoDB() {
         await client.connect();
         const db = client.db("zapShift_db");
         const parcelsCollection = db.collection("parcels");
+        const paymentCollection = db.collection("payments")
 
         app.get("/parcels", async (req, res) => {
             const query = {};
@@ -77,7 +85,8 @@ async function connectToMongoDB() {
                 ],
                 mode: "payment",
                 metadata: {
-                    parcelId: paymentInfo.parcelId
+                    parcelId: paymentInfo.parcelId,
+                    parcelName: paymentInfo.parcelName
                 },
                 customer_email: paymentInfo.senderEmail,
                 success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-successful?session_id={CHECKOUT_SESSION_ID}`,
@@ -117,7 +126,23 @@ async function connectToMongoDB() {
         app.patch("/payment-success", async (req, res) => {
             const sessionId = req.query.session_id;
             const session = await stripe.checkout.sessions.retrieve(sessionId);
-            console.log("session retrieve", session);
+            // console.log("session retrieve", session);
+
+            const transactionId = session.payment_intent;
+            const trackingId = generateTrackingId();
+            const query = {
+                transactionId: transactionId
+            };
+            const paymentExist = await paymentCollection.findOne(query);
+
+            if (paymentExist) {
+                return res.send({
+                    message: 'already exist',
+                    transactionId: paymentExist.transactionId,
+                    trackingId: paymentExist.trackingId
+                })
+            }
+
             if (session.payment_status === 'paid') {
                 const id = session.metadata.parcelId;
                 const query = {
@@ -125,11 +150,35 @@ async function connectToMongoDB() {
                 }
                 const update = {
                     $set: {
-                        paymentStatus: 'paid'
+                        paymentStatus: 'paid',
+                        trackingId: trackingId
                     }
                 }
+
                 const result = await parcelsCollection.updateOne(query, update);
-                res.send(result);
+
+                const payment = {
+                    amount: session.amount_total,
+                    currency: session.currency,
+                    customerEmail: session.customer_email,
+                    parcelId: session.metadata.parcelId,
+                    parcelName: session.metadata.parcelName,
+                    transactionId: session.payment_intent,
+                    paymentStatus: session.payment_status,
+                    paidAt: new Date(),
+                    trackingId: trackingId
+                }
+
+                if (session.payment_status === 'paid') {
+                    const paymentResult = await paymentCollection.insertOne(payment);
+                    res.send({
+                        success: true,
+                        modifyParcel: result,
+                        trackingId: trackingId,
+                        transactionId: session.payment_intent,
+                        paymentInfo: paymentResult
+                    })
+                }
             }
 
             res.send({ sucess: false })
