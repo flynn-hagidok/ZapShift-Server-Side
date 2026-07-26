@@ -6,6 +6,14 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET);
 const app = express();
 const port = process.env.PORT || 5000;
 const crypto = require("crypto");
+var admin = require("firebase-admin");
+
+var serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+
 
 function generateTrackingId() {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
@@ -17,13 +25,29 @@ function generateTrackingId() {
 app.use(express.json());
 app.use(cors());
 
-const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.zgye7fw.mongodb.net/?appName=Cluster0`);
+const verifyFBToken = async (req, res, next) => {
+    const token = req.headers.authorization;
+    if (!token) {
+        return res.status(401).send({ message: "unathorized access" });
+    };
 
+    try {
+        const idToken = token.split(' ')[1];
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        req.decoded_email = decoded.email;
+        next();
+    } catch (err) {
+        res.status(401).send({ message: 'unauthorized access' });
+    }
+}
+
+const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.zgye7fw.mongodb.net/?appName=Cluster0`);
 
 async function connectToMongoDB() {
     try {
         await client.connect();
         const db = client.db("zapShift_db");
+        const usersCollection = db.collection("users");
         const parcelsCollection = db.collection("parcels");
         const paymentCollection = db.collection("payments")
 
@@ -118,7 +142,6 @@ async function connectToMongoDB() {
                 success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-successful`,
                 cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
             })
-            console.log(session);
             res.send({ url: session.url })
         });
 
@@ -126,7 +149,6 @@ async function connectToMongoDB() {
         app.patch("/payment-success", async (req, res) => {
             const sessionId = req.query.session_id;
             const session = await stripe.checkout.sessions.retrieve(sessionId);
-            // console.log("session retrieve", session);
 
             const transactionId = session.payment_intent;
             const trackingId = generateTrackingId();
@@ -182,6 +204,20 @@ async function connectToMongoDB() {
             }
 
             res.send({ sucess: false })
+        })
+
+        //payments related apis
+        app.get("/payments", verifyFBToken, async (req, res) => {
+            const email = req.query.email;
+            const query = {};
+            if (email) {
+                query.customerEmail = email;
+                if (email !== req.decoded_email) {
+                    res.status(403).send({ message: 'forbidden access' });
+                }
+            };
+            const result = await paymentCollection.find(query).sort({ paidAt: -1 }).toArray();
+            res.send(result);
         })
 
     } catch (err) {
