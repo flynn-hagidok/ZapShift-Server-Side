@@ -8,7 +8,8 @@ const port = process.env.PORT || 5000;
 const crypto = require("crypto");
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = require(decoded);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
