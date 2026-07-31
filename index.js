@@ -51,6 +51,17 @@ async function connectToMongoDB() {
         const parcelsCollection = db.collection("parcels");
         const paymentCollection = db.collection("payments");
         const riderCollection = db.collection("riders");
+        const trackingsCollection = db.collection("trackings");
+
+        const verifyRider = async (req, res, next) => {
+            const email = req.decoded_email;
+            const query = { email };
+            const user = await usersCollection.findOne(query);
+            if (!user || user.role !== 'rider') {
+                return res.status(403).send({ message: "forbidden access" });
+            }
+            next();
+        };
 
         const verifyAdmin = async (req, res, next) => {
             const email = req.decoded_email;
@@ -60,7 +71,19 @@ async function connectToMongoDB() {
                 return res.status(403).send({ message: "forbidden access" });
             }
             next();
-        }
+        };
+
+        const logTracking = async (trackingId, status) => {
+            const log = {
+                trackingId,
+                status,
+                details: status.split("-").join(" "),
+                createdAt: new Date()
+            }
+
+            const result = await trackingsCollection.insertOne(log);
+            return result;
+        };
 
         app.get("/users", verifyFBToken, async (req, res) => {
             const search = req.query.search;
@@ -141,13 +164,17 @@ async function connectToMongoDB() {
             if (riderEmail) {
                 query.riderEmail = riderEmail;
             }
-            if (delivery) {
+            if (delivery !== "parcel_delivered") {
                 // query.delivery = { $in: ['pickup', 'rider_arrived'] }
                 query.delivery = { $nin: ['parcel_delivered'] }
             }
+            else {
+                query.delivery = delivery
+            }
+
             const result = await parcelsCollection.find(query).toArray();
             res.send(result);
-        })
+        });
 
         app.get("/parcels/:id", async (req, res) => {
             const id = req.params.id;
@@ -156,7 +183,27 @@ async function connectToMongoDB() {
             }
             const result = await parcelsCollection.findOne(query);
             res.send(result);
-        })
+        });
+
+        app.get("/parcels/delivery-status/stats", async (req, res) => {
+            const pipeline = [
+                {
+                    $group: {
+                        _id: '$delivery',
+                        count: { $sum: 1 }
+                    }
+                },
+                {
+                    $project: {
+                        status: '$_id',
+                        count: 1,
+                        // _id: 0
+                    }
+                }
+            ]
+            const result = await parcelsCollection.aggregate(pipeline).toArray();
+            res.send(result);
+        });
 
         app.post("/parcels", async (req, res) => {
             const parcels = req.body;
@@ -176,7 +223,7 @@ async function connectToMongoDB() {
         });
 
         app.patch("/parcels/:id", async (req, res) => {
-            const { riderId, riderEmail, riderName, riderPhone } = req.body;
+            const { riderId, riderEmail, riderName, riderPhone, trackingId } = req.body;
             const id = req.params.id;
             const query = {
                 _id: new ObjectId(id)
@@ -201,12 +248,13 @@ async function connectToMongoDB() {
                 }
             };
             const riderResult = await riderCollection.updateOne(riderQuery, updateRiderDocs);
+            logTracking(trackingId, 'pickup')
             res.send(riderResult)
 
         });
 
         app.patch("/parcels/:id/status", async (req, res) => {
-            const { deliveryStatus } = req.body;
+            const { deliveryStatus, riderId, trackingId } = req.body;
             const id = req.params.id;
             const query = {
                 _id: new ObjectId(id)
@@ -216,7 +264,21 @@ async function connectToMongoDB() {
                     delivery: deliveryStatus
                 }
             };
+
+            if (deliveryStatus === "parcel_delivered") {
+                const riderQuery = {
+                    _id: new ObjectId(riderId)
+                };
+                const updateStatus = {
+                    $set: {
+                        workStatus: "available"
+                    }
+                }
+                const riderResult = await riderCollection.updateOne(riderQuery, updateStatus);
+                res.send(riderResult);
+            }
             const result = await parcelsCollection.updateOne(query, updateStatus);
+            logTracking(trackingId, deliveryStatus)
             res.send(result);
         });
 
@@ -327,7 +389,10 @@ async function connectToMongoDB() {
 
                 if (session.payment_status === 'paid') {
                     const paymentResult = await paymentCollection.insertOne(payment);
-                    res.send({
+
+                    logTracking(trackingId, 'pending-pickup')
+
+                    return res.send({
                         success: true,
                         modifyParcel: result,
                         trackingId: trackingId,
@@ -337,7 +402,7 @@ async function connectToMongoDB() {
                 }
             }
 
-            res.send({ sucess: false })
+            return res.send({ sucess: false })
         })
 
         //payments related apis
@@ -379,6 +444,52 @@ async function connectToMongoDB() {
             res.send(result);
         });
 
+        app.get("/riders/delivery-per-day", async (req, res) => {
+            const email = req.query.email;
+            const pipeline = [
+                {
+                    $match: {
+                        riderEmail: email,
+                        delivery: 'parcel_delivered'
+                    }
+                },
+                {
+                    $lookup: {
+                        from: "trackings",
+                        localField: "trackingId",
+                        foreignField: "trackingId",
+                        as: "parcel_trackings"
+                    }
+                },
+                {
+                    $unwind: "$parcel_trackings"
+                },
+                {
+                    $match: {
+                        "parcel_trackings.status": 'parcel_delivered'
+                    }
+                },
+                {
+                    $addFields: {
+                        deliveryDay: {
+                            $dateToString: {
+                                format: "%d-%m-%Y",
+                                date: "$parcel_trackings.createdAt"
+                            }
+                        }
+                    }
+                },
+                {
+                    $group: {
+                        _id: "$deliveryDay",
+                        deliveredCount: { $sum: 1 }
+                    }
+                }
+            ]
+            const result = await parcelsCollection.aggregate(pipeline).toArray();
+            res.send(result);
+        })
+
         app.patch("/riders/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             const status = req.body.status;
             console.log(req.body);
@@ -403,6 +514,16 @@ async function connectToMongoDB() {
                 const result = await usersCollection.updateOne(query, updateUser);
             };
 
+            res.send(result);
+        })
+
+        //tracking related apis 
+        app.get("/tracking/:trackingId/logs", async (req, res) => {
+            const { trackingId } = req.params;
+            const query = {
+                trackingId
+            };
+            const result = await trackingsCollection.find(query).toArray();
             res.send(result);
         })
 
